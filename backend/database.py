@@ -14,52 +14,67 @@ logger = logging.getLogger(__name__)
 _SQLITE_FALLBACK = "sqlite+aiosqlite:///./fishing.db"
 
 
+_PG_PREFIXES = ("postgres://", "postgresql://", "postgresql+asyncpg://")
+
+
 def _build_database_url(raw: str) -> tuple[str, bool]:
     """
     Supabase/Railway DATABASE_URL → SQLAlchemy asyncpg 형식으로 안전하게 변환.
 
     처리 순서:
-      1) SQLite면 그대로 반환
-      2) postgres:// / postgresql:// → postgresql+asyncpg:// 로 prefix 교체
-      3) 비밀번호 특수문자 URL 인코딩 (! @ # $ 등)
-      4) 예외 발생 시 SQLite 폴백 반환
+      1) 빈 값·SQLite → 그대로 반환
+      2) 앞뒤 공백 / 따옴표 제거 (Railway 대시보드 복붙 오류 방어)
+      3) postgres:// / postgresql:// → postgresql+asyncpg:// prefix 교체
+      4) 비밀번호 특수문자 URL 인코딩 (! @ # $ % 등)
+      5) 예외·비URL 값 → SQLite 폴백 + 명확한 경고 로그
 
     Returns:
-        (url, is_postgres)
+        (database_url, is_postgres)
     """
     if not raw or raw.startswith("sqlite"):
-        return raw, False
+        return raw or _SQLITE_FALLBACK, False
+
+    # ── Step 1: 공백 / 따옴표 제거 ─────────────────────────────────────
+    cleaned = raw.strip().strip("'\"")
+
+    # ── Step 2: URL 형식 사전 검사 ──────────────────────────────────────
+    if not any(cleaned.startswith(p) for p in _PG_PREFIXES):
+        logger.error(
+            "DATABASE_URL이 올바른 PostgreSQL URL 형식이 아닙니다.\n"
+            "  받은 값 앞부분: %r\n"
+            "  Railway Variables에 실제 Supabase 연결 문자열을 붙여넣었는지 확인하세요.\n"
+            "  예시 형식: postgresql://user:password@host:6543/postgres\n"
+            "  → SQLite 폴백으로 계속 실행합니다.",
+            cleaned[:60],
+        )
+        return _SQLITE_FALLBACK, False
 
     try:
-        # ── Step 1: prefix 교체 ─────────────────────────────────────────
-        if raw.startswith("postgres://"):
-            url = "postgresql+asyncpg://" + raw[len("postgres://"):]
-        elif raw.startswith("postgresql://") and "+asyncpg" not in raw:
-            url = "postgresql+asyncpg://" + raw[len("postgresql://"):]
-        elif raw.startswith("postgresql+asyncpg://"):
-            url = raw
+        # ── Step 3: prefix → postgresql+asyncpg:// ────────────────────
+        if cleaned.startswith("postgres://"):
+            url = "postgresql+asyncpg://" + cleaned[len("postgres://"):]
+        elif cleaned.startswith("postgresql://") and "+asyncpg" not in cleaned:
+            url = "postgresql+asyncpg://" + cleaned[len("postgresql://"):]
         else:
-            raise ValueError(f"알 수 없는 DB URL 형식: {raw[:40]}")
+            url = cleaned  # 이미 postgresql+asyncpg://
 
-        # ── Step 2: 비밀번호 URL 인코딩 ────────────────────────────────
+        # ── Step 4: 비밀번호 URL 인코딩 ────────────────────────────────
         # postgresql+asyncpg://USER:PASSWORD@HOST:PORT/DB
-        # 비밀번호에 ! % @ : / 등이 있으면 파싱 실패 → quote() 로 인코딩
+        # 비밀번호의 ! @ # $ % 등 특수문자를 %XX 형태로 인코딩
         m = re.match(
             r"(postgresql\+asyncpg://)([^:@]+):([^@]+)@(.+)",
             url,
         )
         if m:
             scheme, user, password, rest = m.groups()
-            safe_pw = quote(password, safe="")   # 모든 특수문자 인코딩
+            safe_pw = quote(password, safe="")
             url = f"{scheme}{user}:{safe_pw}@{rest}"
 
-        logger.info("DATABASE_URL 변환 완료 → %s", url.split("@")[-1])
+        logger.info("DATABASE_URL 변환 완료 → host: %s", url.split("@")[-1].split("/")[0])
         return url, True
 
     except Exception as exc:
-        logger.error(
-            "DATABASE_URL 변환 실패 → SQLite 폴백 (원인: %s)", exc
-        )
+        logger.error("DATABASE_URL 변환 중 예외 → SQLite 폴백 (원인: %s)", exc)
         return _SQLITE_FALLBACK, False
 
 

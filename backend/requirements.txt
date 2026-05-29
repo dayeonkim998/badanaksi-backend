@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+httpx
+apscheduler
+beautifulsoup4
+aiohttp
+sqlalchemy
+aiosqlite
+python-dotenv
+anthropic
+python-multipart
+PyJWT>=2.8.0
+asyncpg>=0.29.0

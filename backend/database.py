@@ -1,26 +1,50 @@
+import logging
 import os
+import ssl
 import uuid
 from datetime import datetime
 from sqlalchemy import Boolean, Column, DateTime, Float, Integer, String, Text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
-# Railway/Supabase는 DATABASE_URL 환경변수로 PostgreSQL URL을 주입
-# 로컬 개발: SQLite 사용
+logger = logging.getLogger(__name__)
+
+# ── Database URL 구성 ────────────────────────────────────────────────────────
+# 우선순위: Railway $DATABASE_URL → .env DATABASE_URL → SQLite(로컬 개발)
 _raw_db_url = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./fishing.db")
 
+_is_postgres = _raw_db_url.startswith(("postgres://", "postgresql://"))
+
 if _raw_db_url.startswith("postgres://"):
-    # Railway는 postgres:// 접두사를 사용 → asyncpg 드라이버로 변환
     DATABASE_URL = _raw_db_url.replace("postgres://", "postgresql+asyncpg://", 1)
 elif _raw_db_url.startswith("postgresql://") and "+asyncpg" not in _raw_db_url:
     DATABASE_URL = _raw_db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
 else:
     DATABASE_URL = _raw_db_url
 
-# PostgreSQL: connect_args 불필요 / SQLite: check_same_thread=False 필요
-_connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
+# ── 엔진 옵션 ────────────────────────────────────────────────────────────────
+if _is_postgres:
+    # Supabase/Railway PostgreSQL: SSL 필수, 커넥션 풀 설정
+    _ssl_ctx = ssl.create_default_context()
+    _ssl_ctx.check_hostname = False
+    _ssl_ctx.verify_mode = ssl.CERT_NONE   # Supabase pooler 인증서 체인 우회
 
-engine = create_async_engine(DATABASE_URL, echo=False, connect_args=_connect_args)
+    _engine_kwargs: dict = {
+        "echo":            False,
+        "pool_size":       5,
+        "max_overflow":    10,
+        "pool_timeout":    30,
+        "pool_recycle":    1800,
+        "connect_args":    {"ssl": _ssl_ctx, "timeout": 10},
+    }
+else:
+    # SQLite (로컬 개발)
+    _engine_kwargs = {
+        "echo":         False,
+        "connect_args": {"check_same_thread": False},
+    }
+
+engine = create_async_engine(DATABASE_URL, **_engine_kwargs)
 AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 
@@ -156,8 +180,13 @@ class Report(Base):
 
 
 async def init_db():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    """DB 초기화 — 실패해도 앱 시작은 계속 (Railway 배포 안전)"""
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        logger.info("DB 초기화 완료: %s", DATABASE_URL.split("@")[-1] if "@" in DATABASE_URL else "sqlite")
+    except Exception as e:
+        logger.error("DB 초기화 실패 (앱은 계속 실행): %s", e)
 
 
 async def get_session():

@@ -1,10 +1,15 @@
 from dotenv import load_dotenv
 load_dotenv()  # .env를 임포트보다 먼저 로드
 
+import logging
+import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from database import init_db
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 from api.weather import router as weather_router
 from api.forecast import router as forecast_router
 from api.vision import router as vision_router
@@ -26,8 +31,12 @@ from api.admin.notifications import router as admin_notifications_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    port = os.getenv("PORT", "8000")
+    logger.info("🚀 바다낚시 API 시작 중 (port=%s)", port)
     await init_db()
+    logger.info("✅ 서버 준비 완료")
     yield
+    logger.info("🛑 서버 종료")
 
 
 app = FastAPI(title="바다낚시 플랫폼 API", version="0.2.0", lifespan=lifespan)

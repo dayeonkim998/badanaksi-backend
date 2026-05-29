@@ -1,44 +1,89 @@
 import logging
 import os
+import re
 import ssl
 import uuid
 from datetime import datetime
+from urllib.parse import quote, urlparse
 from sqlalchemy import Boolean, Column, DateTime, Float, Integer, String, Text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 logger = logging.getLogger(__name__)
 
-# ── Database URL 구성 ────────────────────────────────────────────────────────
-# 우선순위: Railway $DATABASE_URL → .env DATABASE_URL → SQLite(로컬 개발)
-_raw_db_url = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./fishing.db")
+_SQLITE_FALLBACK = "sqlite+aiosqlite:///./fishing.db"
 
-_is_postgres = _raw_db_url.startswith(("postgres://", "postgresql://"))
 
-if _raw_db_url.startswith("postgres://"):
-    DATABASE_URL = _raw_db_url.replace("postgres://", "postgresql+asyncpg://", 1)
-elif _raw_db_url.startswith("postgresql://") and "+asyncpg" not in _raw_db_url:
-    DATABASE_URL = _raw_db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
-else:
-    DATABASE_URL = _raw_db_url
+def _build_database_url(raw: str) -> tuple[str, bool]:
+    """
+    Supabase/Railway DATABASE_URL → SQLAlchemy asyncpg 형식으로 안전하게 변환.
+
+    처리 순서:
+      1) SQLite면 그대로 반환
+      2) postgres:// / postgresql:// → postgresql+asyncpg:// 로 prefix 교체
+      3) 비밀번호 특수문자 URL 인코딩 (! @ # $ 등)
+      4) 예외 발생 시 SQLite 폴백 반환
+
+    Returns:
+        (url, is_postgres)
+    """
+    if not raw or raw.startswith("sqlite"):
+        return raw, False
+
+    try:
+        # ── Step 1: prefix 교체 ─────────────────────────────────────────
+        if raw.startswith("postgres://"):
+            url = "postgresql+asyncpg://" + raw[len("postgres://"):]
+        elif raw.startswith("postgresql://") and "+asyncpg" not in raw:
+            url = "postgresql+asyncpg://" + raw[len("postgresql://"):]
+        elif raw.startswith("postgresql+asyncpg://"):
+            url = raw
+        else:
+            raise ValueError(f"알 수 없는 DB URL 형식: {raw[:40]}")
+
+        # ── Step 2: 비밀번호 URL 인코딩 ────────────────────────────────
+        # postgresql+asyncpg://USER:PASSWORD@HOST:PORT/DB
+        # 비밀번호에 ! % @ : / 등이 있으면 파싱 실패 → quote() 로 인코딩
+        m = re.match(
+            r"(postgresql\+asyncpg://)([^:@]+):([^@]+)@(.+)",
+            url,
+        )
+        if m:
+            scheme, user, password, rest = m.groups()
+            safe_pw = quote(password, safe="")   # 모든 특수문자 인코딩
+            url = f"{scheme}{user}:{safe_pw}@{rest}"
+
+        logger.info("DATABASE_URL 변환 완료 → %s", url.split("@")[-1])
+        return url, True
+
+    except Exception as exc:
+        logger.error(
+            "DATABASE_URL 변환 실패 → SQLite 폴백 (원인: %s)", exc
+        )
+        return _SQLITE_FALLBACK, False
+
+
+# ── Database URL 확정 ────────────────────────────────────────────────────────
+_raw_db_url = os.getenv("DATABASE_URL", _SQLITE_FALLBACK)
+DATABASE_URL, _is_postgres = _build_database_url(_raw_db_url)
 
 # ── 엔진 옵션 ────────────────────────────────────────────────────────────────
 if _is_postgres:
-    # Supabase/Railway PostgreSQL: SSL 필수, 커넥션 풀 설정
+    # Supabase/Railway PostgreSQL: SSL 필수
     _ssl_ctx = ssl.create_default_context()
     _ssl_ctx.check_hostname = False
-    _ssl_ctx.verify_mode = ssl.CERT_NONE   # Supabase pooler 인증서 체인 우회
+    _ssl_ctx.verify_mode = ssl.CERT_NONE   # Supabase Pooler 인증서 체인 우회
 
     _engine_kwargs: dict = {
-        "echo":            False,
-        "pool_size":       5,
-        "max_overflow":    10,
-        "pool_timeout":    30,
-        "pool_recycle":    1800,
-        "connect_args":    {"ssl": _ssl_ctx, "timeout": 10},
+        "echo":         False,
+        "pool_size":    5,
+        "max_overflow": 10,
+        "pool_timeout": 30,
+        "pool_recycle": 1800,
+        "connect_args": {"ssl": _ssl_ctx, "timeout": 10},
     }
 else:
-    # SQLite (로컬 개발)
+    # SQLite (로컬 개발 또는 폴백)
     _engine_kwargs = {
         "echo":         False,
         "connect_args": {"check_same_thread": False},
